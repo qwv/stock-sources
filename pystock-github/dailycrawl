@@ -1,0 +1,207 @@
+#!/bin/bash
+version="0.1.0"
+
+# Same time zone with US stock market
+export TZ="America/New_York"
+
+# Maximum compression level
+export GZIP="-9"
+
+# Arguments that will be passed from command line
+script_dir=`pwd`    # Directory containing this script, which is used to locate holiday files
+repo_dir=""         # Where pystock-crawler works and output files go
+end_date=""
+
+# Required executables
+git_bin="git"
+crawler_bin="pystock-crawler"
+
+print_version() {
+    echo "pystock-github $version"
+}
+
+print_help() {
+    print_version
+    echo "Usage:"
+    echo "  dailycrawl [-r REPO_DIR] [-c SCRIPT_DIR] [-s START_DATE] [-e END_DATE]"
+    echo "  dailycrawl (-h | --help)"
+    echo "  dailycrawl (-v | --version)"
+}
+
+error() {
+    echo "Error: $1"
+}
+
+# Check if a directory exists
+check_dir() {
+    if [ ! -d "$1" ]; then
+        error "directory '$1' does not exist"
+        exit 1
+    fi
+}
+
+# Check if an executable exists
+check_bin() {
+    hash $1 2>/dev/null || { error "'$1' cannot be found in PATH: $PATH"; exit 2; }
+}
+
+# Add a directory into PATH if it does not exist in PATH
+add_path() {
+    if [ -d "$1" ] && [[ ":$PATH:" != *":$1:"* ]]; then
+        PATH="${PATH:+"$PATH:"}$1"
+    fi
+}
+
+# If historical price data on Yahoo Finance is ready now, return today
+# Otherwise, return yesterday
+get_end_date() {
+    # Assume today's price data on Yahoo Finance is ready at 22:00
+    yahoo_ready="22:00"
+    now=`date +%H:%M`
+    if [ "$now" \< "$yahoo_ready" ]; then
+        date -d "-1 day" +%Y%m%d
+    else
+        date +%Y%m%d
+    fi
+}
+
+# Check if a date (YYYYMMDD) is a holiday
+is_holiday() {
+    # Saturday or Sunday?
+    weekday=`date -d $1 +%u`
+    if [ "$weekday" = 6 -o "$weekday" = 7 ]; then
+        echo $1
+    else
+        # US holiday?
+        year=`date -d $1 +%Y`
+        holiday_file="$script_dir/holidays/$year.txt"
+        cat $holiday_file | grep $1
+    fi
+}
+
+# Get the previous date of a date (YYYYMMDD)
+get_prev_date() {
+    date -d "$1 -1 day" +%Y%m%d
+}
+
+# Some paths may be only added after login, which makes some commands such as 'aws'
+# unavailable in crontab's @reboot. Add them here just in case.
+add_path "/usr/local/bin"
+add_path "/sbin"
+
+# Parse command arguments
+while test "$1" != ""
+do
+    case $1 in
+        --help|-h)
+            print_help
+            exit 0
+            ;;
+        --version|-v)
+            print_version
+            exit 0
+            ;;
+        --repo-dir|-r)
+            shift
+            repo_dir="$1"
+            ;;
+        --script-dir|-c)
+            shift
+            script_dir="$1"
+            ;;
+        --start-date|-s)
+            shift
+            start_date="$1"
+            ;;
+        --end-date|-e)
+            shift
+            end_date="$1"
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [ ! "$repo_dir" ]; then
+    error "must specify a Git repo"
+    exit 1
+fi
+
+# Auto-set end_date if not specified
+if [ ! "$end_date" ]; then
+    end_date=`get_end_date`
+fi
+
+# Check directories
+check_dir $repo_dir
+check_dir $script_dir
+
+# Check if required commands are available
+check_bin $git_bin
+check_bin $crawler_bin
+
+# Do nothing if end_date is holiday
+if [ `is_holiday $end_date` ]; then
+    echo "'$end_date' is holiday, stock market is closed"
+    exit 0
+fi
+
+# If start_date is not specified, set it to the first previous
+# non-holiday (counting backward from end_date)
+if [ ! "$start_date" ]; then
+    start_date=`get_prev_date $end_date`
+    while [ `is_holiday $start_date` ]
+    do
+        start_date=`get_prev_date $start_date`
+    done
+fi
+
+# Create output directory: REPO_DIR/YYYY/MM/DD
+date_dir=`date -d $end_date +%Y/%m/%d`
+output_dir="$repo_dir/$date_dir"
+mkdir -p $output_dir
+
+echo "Start date: $start_date"
+echo "End date: $end_date"
+echo "Repo directory: $repo_dir"
+echo "Script directory: $script_dir"
+echo "Output directory: $output_dir"
+
+orig_dir=`pwd`
+cd $repo_dir
+
+echo "Crawling symbols..."
+$crawler_bin symbols NYSE,NASDAQ,AMEX -o $output_dir/symbols.txt -l $output_dir/symbols.log
+
+echo "Crawling prices..."
+$crawler_bin prices $output_dir/symbols.txt -o $output_dir/prices.csv -s $start_date -e $end_date -l $output_dir/prices.log
+
+echo "Crawling reports..."
+$crawler_bin reports $output_dir/symbols.txt -o $output_dir/reports.csv -s $start_date -l $output_dir/reports.log
+
+cd $output_dir
+
+echo "Compressing $output_dir..."
+
+year_dir=`date -d $end_date +%Y`
+filename=`date -d $end_date +%Y%m%d`
+
+tar -czf $repo_dir/$year_dir/$filename.tar.gz symbols.txt prices.csv reports.csv
+
+echo "Generating index pages..."
+genindex_bin="$script_dir/genindex"
+$genindex_bin $repo_dir --html --txt
+$genindex_bin $repo_dir/$year_dir --html --txt
+
+cd $repo_dir
+
+echo "Committing to Git repo..."
+$git_bin add *.tar.gz
+$git_bin add */index.txt
+$git_bin add */index.html
+$git_bin commit -m "$end_date"
+$git_bin push origin HEAD
+
+cd $orig_dir
+echo "Done"
